@@ -62,3 +62,58 @@
 ### Monorepo
 
 1. 백엔드와 프론트엔드는 같은 저장소를 사용합니다. 이 프로젝트에서도 함께 구현되어야 합니다.
+
+---
+
+## Implementation Progress
+
+### Data Collection Pipeline (2025-02-15)
+
+#### Decisions Made
+
+1. **Collection 방식**: OpenAI Responses API + `web_search` tool 사용. 웹 스크래핑 없이 AI가 직접 웹 검색 후 한국 트렌딩 토픽을 수집 및 분석.
+   - `POST /v1/responses` with `{"type": "web_search"}`
+   - 프로토타입 단계에서 가장 간단한 접근. 품질이 부족하면 추후 Naver 키워드 스크래핑 + AI 분석 하이브리드 방식으로 전환 검토.
+
+2. **데이터 모델**: `context_items`는 `collection_runs`의 자식 레코드로 정규화.
+   - 기존 JSONB blob 방식 대신 개별 row로 저장.
+   - 각 item은 `category` 태그를 가짐 ("top", "entertainment", "finance" 등).
+   - "top"은 별도 구조가 아니라 하나의 카테고리로 취급.
+   - 이유: 카테고리별 쿼리, 유저 구독 매칭, 확장성.
+
+3. **아키텍처 원칙**: 순수 함수 + 인터페이스 주입.
+   - `collector.Service.Collect(ctx)` 는 caller-agnostic 순수 함수.
+   - DB, 네트워크 등 impure 의존성은 인터페이스로 주입.
+   - HTTP handler, cron scheduler, CLI, test 어디서든 호출 가능.
+   - config, database 패키지는 협업 개발자가 구현 (유저 기능과 공유).
+
+#### Implemented Files
+
+```
+server/
+├── migrations/
+│   ├── 000001_create_collections.up.sql    # collection_runs + context_items 테이블
+│   └── 000001_create_collections.down.sql  # rollback
+├── internal/
+│   ├── ai/
+│   │   ├── client.go                       # ai.Client 인터페이스 + OpenAIClient (HTTP 직접 호출)
+│   │   └── client_test.go                  # httptest 서버로 모킹, good/bad 케이스
+│   └── collector/
+│       ├── model.go                        # CollectionRun, ContextItem, CollectionResult
+│       ├── repository.go                   # Repository 인터페이스만 (DB 구현 없음)
+│       ├── prompt.go                       # 한국어 프롬프트 템플릿
+│       ├── service.go                      # Collect(ctx) 핵심 함수
+│       └── service_test.go                 # mock ai.Client + mock Repository, 6개 테스트
+```
+
+- 테스트: 11개 전체 통과, ai 88.9%, collector 84.4% 커버리지
+- 의존성: `github.com/google/uuid` 만 추가 (OpenAI SDK 미사용, 직접 HTTP)
+
+#### Next Steps
+
+1. **Repository 구현체**: `collector.Repository` 인터페이스의 PostgreSQL 구현 (pgx). DB 연결, config 패키지와 함께 구현 필요.
+2. **실제 테스트**: OpenAI API 키로 `Collect(ctx)` 실행하여 한국 트렌딩 토픽 품질 확인.
+3. **프롬프트 튜닝**: 실제 결과물 기반으로 프롬프트 개선. 특정 웹사이트 참조 추가, 키워드 추출 분리 등 실험.
+4. **스케줄러 통합**: cron 또는 scheduler에서 `Collect(ctx)` 호출하도록 연결.
+5. **HTTP handler**: 수동 트리거용 admin endpoint 추가.
+6. **품질 부족 시 대안**: Naver 실시간 검색어 키워드 스크래핑 -> OpenAI web_search로 상세 맥락 수집 (hybrid-lite).

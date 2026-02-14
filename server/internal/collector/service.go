@@ -1,0 +1,121 @@
+package collector
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"ota/internal/ai"
+)
+
+type Service struct {
+	ai   ai.Client
+	repo Repository
+}
+
+func NewService(aiClient ai.Client, repo Repository) *Service {
+	return &Service{
+		ai:   aiClient,
+		repo: repo,
+	}
+}
+
+func (s *Service) Collect(ctx context.Context) (CollectionResult, error) {
+	run := CollectionRun{
+		ID:        uuid.New(),
+		StartedAt: time.Now().UTC(),
+		Status:    "running",
+	}
+
+	if err := s.repo.CreateRun(ctx, run); err != nil {
+		return CollectionResult{}, fmt.Errorf("creating collection run: %w", err)
+	}
+
+	prompt := BuildCollectionPrompt()
+
+	resp, err := s.ai.SearchAndAnalyze(ctx, prompt)
+	if err != nil {
+		errMsg := err.Error()
+		_ = s.repo.CompleteRun(ctx, run.ID, "failed", &errMsg, nil)
+		return CollectionResult{}, fmt.Errorf("collecting: %w", err)
+	}
+
+	items, err := parseContextItems(resp.OutputText, run.ID)
+	if err != nil {
+		errMsg := err.Error()
+		rawResp := resp.RawJSON
+		_ = s.repo.CompleteRun(ctx, run.ID, "failed", &errMsg, &rawResp)
+		return CollectionResult{}, fmt.Errorf("parsing ai response: %w", err)
+	}
+
+	if err := s.repo.SaveContextItems(ctx, items); err != nil {
+		errMsg := err.Error()
+		rawResp := resp.RawJSON
+		_ = s.repo.CompleteRun(ctx, run.ID, "failed", &errMsg, &rawResp)
+		return CollectionResult{}, fmt.Errorf("saving context items: %w", err)
+	}
+
+	now := time.Now().UTC()
+	rawResp := resp.RawJSON
+	run.CompletedAt = &now
+	run.Status = "success"
+	run.RawResponse = &rawResp
+
+	if err := s.repo.CompleteRun(ctx, run.ID, "success", nil, &rawResp); err != nil {
+		return CollectionResult{}, fmt.Errorf("completing run: %w", err)
+	}
+
+	return CollectionResult{Run: run, Items: items}, nil
+}
+
+type aiResponsePayload struct {
+	Items []aiContextItem `json:"items"`
+}
+
+type aiContextItem struct {
+	Category string   `json:"category"`
+	Rank     int      `json:"rank"`
+	Topic    string   `json:"topic"`
+	Summary  string   `json:"summary"`
+	Sources  []string `json:"sources"`
+}
+
+func parseContextItems(outputText string, runID uuid.UUID) ([]ContextItem, error) {
+	var payload aiResponsePayload
+	if err := json.Unmarshal([]byte(outputText), &payload); err != nil {
+		return nil, fmt.Errorf("invalid json from ai: %w", err)
+	}
+
+	if len(payload.Items) == 0 {
+		return nil, fmt.Errorf("ai returned empty items")
+	}
+
+	items := make([]ContextItem, 0, len(payload.Items))
+	for _, raw := range payload.Items {
+		if raw.Topic == "" || raw.Summary == "" || raw.Category == "" {
+			continue
+		}
+		items = append(items, ContextItem{
+			ID:              uuid.New(),
+			CollectionRunID: runID,
+			Category:        raw.Category,
+			Rank:            raw.Rank,
+			Topic:           raw.Topic,
+			Summary:         raw.Summary,
+			Sources:         raw.Sources,
+		})
+	}
+
+	if len(items) == 0 {
+		return nil, fmt.Errorf("no valid context items after filtering")
+	}
+
+	return items, nil
+}
+
+func strPtr(s string) *string {
+	return &s
+}
